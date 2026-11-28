@@ -1,6 +1,6 @@
 # Reviews in two pages: Organize and Coverage
 
-Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC and O1 to O5 are built and deployed** (each has its "as built" section below); O6 is not. On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
+Proposal, 27 November 2026, asked for the same day. The eight decisions at the end were taken that day, all as recommended. **O0, OC and O1 to O5 are built and deployed; O6 is built and tested and waits to be deployed** (each has its "as built" section below). On the same day the administrator added that connected projects have to be taken into account as if they were part of the project: the plan was adjusted, with one more phase (OC) before O1. See "Connected projects", at the end.
 
 ## What is asked for
 
@@ -879,3 +879,67 @@ Every address of a view that is gone was opened and led on: `needs-you` to Organ
 - **The check "is a User Story that nothing supports still wanted?" has no button of its own any more.** Organize answers the question differently (it writes the Issues, finds the work done, or finds nothing that says what to do, and puts the last two before the administrator). As a check it still runs where Settings say it runs by itself, and what it finds reaches the batches that close Stories nothing stands behind.
 - **The table of every User Story's state is gone.** The numbers by state are in the plan of User Stories and Issues, and each Story's state is on the page of its Epic.
 - **"Discovery" is still what the reading of a repository is called** in Settings and in the costs by workflow. It is a workflow, no longer a view.
+
+## O6 as built (28 November 2026)
+
+The last phase. A run starts by itself where the settings say so, what it did is told, and the record that decides what is applied without the administrator starts anew when the models behind it change. `dashboard/organize_auto.py` is the new part; the rest is in the settings, the list of what waits, the digest and the chat.
+
+### What starts by itself
+
+Under Settings, "What starts by itself" lists four runs, each with three choices (only when you start it; by itself as records and documents arrive; by itself each night):
+
+| Run | By itself it does |
+| --- | --- |
+| Organize: Epics and User Stories | What its button does |
+| Organize: User Stories and Issues | What its button does. A new Issue is under a User Story, or in "Needs you", without a button |
+| Coverage | What its button does. Its first start reads the documentation into parts; later it starts when the documentation was read again and changed, or parts wait |
+| Connections: carrying out a plan that changed | The plan of a connection is brought up to date by the platform whenever a record of either project changes (OC). With this setting the plan the project owns is also carried out, where nothing stands against it |
+
+All four are off until the administrator says otherwise: asking a model costs money. A run that starts by itself is the same run, with the same models, limits and lists. Four rules keep it from spending what was not meant:
+
+- **As records arrive** means within half an hour of something for the run to do, and never within half an hour of its last start by itself. **Each night** means once, between 1 and 5 UTC.
+- **A run estimated to pass the month's limit is not started by itself.** It waits for the administrator's word, as decision 7 says, and the page says why.
+- **A run that left as much to do as it found is not started again for a day**, unless what waits changes. What it could not do, it cannot do half an hour later either. What a run left is noted as it ends.
+- **A project that is paused starts nothing.**
+
+Each page says under its card whether its run starts by itself and what a start would wait for now (`GET /api/dashboard/projects/{name}/reviews/by-itself`).
+
+### What it takes the place of
+
+- **The checks a run asks** (Issues with no User Story, the one Epic of a Story, extra Epic links) could be set to run by themselves since J4. Such a setting is left exactly as it is: the check goes on starting as it was set. It does not let the run start, because a run does more than the check did (it also writes what is missing), and that is allowed for the run by its own setting. Once the run is set to start by itself, it asks the check and gathers what it answers, and the check is no longer started on its own as well. Under Settings such a check is listed only while it is set, with the run that asks it.
+- **The review each record got as it arrived.** Where a run of Organize starts by itself, new records are organized by the run and not reviewed one by one as well: those reviews are not asked, and are no longer counted as waiting. Reviews that asked a question before can still be answered in their panel.
+
+### Told
+
+- **The daily digest** has a part "Organize and Coverage": for each project what the runs that started by themselves did since the last digest (how many, what they applied, created and put before the administrator, and what they cost), and how many cases wait under each page.
+- **The project's Dashboard**, under "What happened without you", says the same for the last day.
+- **The chat's inbox** (`/inbox`, and what the supervisor reads when asked what waits) lists the cases that wait under Organize and under Coverage of each project. They stop nothing, so they come last and are not counted as pressing.
+
+### Measured again when it changes
+
+What a run may apply without the administrator was already decided by a record, kind by kind: the sampled lines the administrator judged and how many of them wrong, and for created records how many were taken away again. Both records were for the project, whatever models had answered.
+
+Now each belongs to a stage, and a stage is its models:
+
+| Stage | Its models | Its record |
+| --- | --- | --- |
+| Decision | The model that answers and the judge | Sampled lines judged, and how many wrong |
+| Writing | The model that writes, the model that answers and the judge (the last two write and check where no writer is set) | Records made, and how many taken away again |
+
+When the administrator changes a model of a stage, what was judged or made with the models before says nothing of the new ones: **the record starts anew from that moment**, and until it holds again nothing of that stage is applied without the administrator. A stage whose new models do worse than the settings accept stops applying, as before. And the change can be taken back: **one word puts the models back as they were before the last change, and the record they had counts again** (`POST .../review-settings/put-back`). Settings shows both records, since when each counts, and the models before.
+
+Setting models for the first time restarts nothing: there is no record that could be stale.
+
+The stages that ask no model measure themselves already and needed nothing: the scorer is fitted again from the known links whenever they change and sets its own bound so that its sure cases stay within the error the settings accept, and the ranking service's measurement ("How well it works") is worked out from the same links.
+
+### Read on live
+
+O6 is not on live yet. When it was ready (28 November, 00:23 UTC) two runs of Coverage the administrator had started were asking, on falcone and on falcone-serverless, and nothing is deployed while a run asks. It is deployed when they have stopped, and this section then says what was read.
+
+Read before the deploy: on falcone three checks are set to run each night (Issues with no User Story, primary Epics, extra Epic links) and one as records arrive (User Stories nothing supports). They go on exactly as set. No other project has anything set to run by itself.
+
+### What is not in O6, and why
+
+- **Nothing was set to start by itself on live.** Every run is off until the administrator chooses otherwise, and choosing is theirs. The path is covered by four tests: a new Issue organized without a button and told; records not reviewed one by one where a run organizes them; the record of a stage starting anew and being put back; a connection's plan carried out by itself.
+- **A changed model is not tried on old questions by itself.** Such a trial exists ("How well it works", try a model on questions already answered) and costs money, so it stays at the administrator's word. What O6 does without spending is start the record anew, hold back what would be applied, and offer the way back.
+- **A run by itself does not publish.** Issues it makes are kept here until the administrator publishes them, and an Epic it writes waits for their word, exactly as with the button.
