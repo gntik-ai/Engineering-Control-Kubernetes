@@ -781,6 +781,16 @@ class BugTriageInput(PlainChangeInput):
     caused_by: str | None = Field(default=None, max_length=200)
 
 
+class BugSuggestionInput(PlainChangeInput):
+    """What the administrator does with a model's suggestion for a new bug: takes it,
+    with the severity and the area as they were suggested or as they were changed;
+    closes the bug as the duplicate the suggestion names; or sets the suggestion aside."""
+
+    choice: Literal["accept", "duplicate", "aside"]
+    severity: Literal["critical", "high", "medium", "low"] | None = None
+    area: str | None = Field(default=None, max_length=60)
+
+
 class BugSeveralInput(PlainChangeInput):
     """One decision for several bugs: a severity or an area, or closing them."""
 

@@ -1137,7 +1137,14 @@ def _prepare(sessions: sessionmaker[Session]) -> _Call | str:
             )
             return _MOVED
         if phase == "back":
-            asked = replace(asked, system=asked.system + _sent_back(review, listed))
+            # A kind whose answers say more than one thing tells in its own words what
+            # the other reader said.
+            told = getattr(scope, "sent_back", None)
+            asked = replace(
+                asked,
+                system=asked.system
+                + (told(review, listed) if told is not None else _sent_back(review, listed)),
+            )
         needed = review_budget.reservation_size(asked)
         if run.spent + needed > run.token_cap:
             left = run.total - run.done - run.failed

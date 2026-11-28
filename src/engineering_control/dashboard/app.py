@@ -32,6 +32,7 @@ from fastapi.responses import (
 from engineering_control.cluster import Cluster, ClusterError
 from engineering_control.config import Settings, get_settings
 from engineering_control.dashboard import (
+    bug_checks,
     bug_numbers,
     doc_inventory,
     evidence_verdicts,
@@ -84,6 +85,7 @@ from engineering_control.dashboard.schemas import (
     BugEditInput,
     BugReportInput,
     BugSeveralInput,
+    BugSuggestionInput,
     BugTriageInput,
     BugUnlinkInput,
     CacheTrialInput,
@@ -1968,6 +1970,81 @@ def create_app(
                 caused_by=body.caused_by,
             ),
             event="workspace.bug_triaged",
+            subject=name,
+        )
+
+    @app.get("/api/dashboard/projects/{name}/bugs/triage")
+    async def bugs_help_api(name: str, request: Request) -> Response:
+        """Help with triage: what a run would ask and cost, the run, and the suggestions
+        that wait, each with its reasons."""
+        return await documents_read(request, lambda: repo(request).bug_triage.shown(name))
+
+    @app.post("/api/dashboard/projects/{name}/bugs/triage/runs")
+    async def bugs_help_start(name: str, request: Request) -> Response:
+        """Begin a run that asks about the new bugs. The administrator's word."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).bug_triage.start, name),
+            event="workspace.bug_triage_started",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/triage/control")
+    async def bugs_help_control(name: str, request: Request) -> Response:
+        return await project_change(
+            request,
+            OrganizeControlInput,
+            lambda b: asyncio.to_thread(repo(request).bug_triage.control, name, b.action),
+            event="workspace.bug_triage_controlled",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/suggestion")
+    async def bug_suggestion_api(name: str, key: UUID, request: Request) -> Response:
+        """Take a suggestion, as it is or changed; close the bug as the duplicate it
+        names; or set the suggestion aside."""
+        return await project_change(
+            request,
+            BugSuggestionInput,
+            lambda body: repo(request).bug_triage.decide(
+                name, key, github(request), body.choice, body.severity, body.area
+            ),
+            event="workspace.bug_suggestion_decided",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/checks")
+    async def bugs_checks_api(name: str, request: Request) -> Response:
+        """Read the checks of the default branch's last commit: each that ended badly
+        and has no bug yet becomes a draft bug. No model is asked."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: bug_checks.read(repo(request).sessions, name, github(request)),
+            event="workspace.bug_checks_read",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/publish")
+    async def bug_publish_api(name: str, key: UUID, request: Request) -> Response:
+        """Report a draft bug on GitHub."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: repo(request).bug_section.publish(name, key, github(request)),
+            event="workspace.bug_reported",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/bugs/{key}/delete")
+    async def bug_delete_api(name: str, key: UUID, request: Request) -> Response:
+        """Delete a bug that is a draft and was never on GitHub."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).bug_section.delete_draft, name, key),
+            event="workspace.bug_draft_deleted",
             subject=name,
         )
 

@@ -477,6 +477,7 @@ WORKFLOWS: Final = {
     "epic_page": "Epic overviews",
     "organize_create": "Organize: records that were written",
     "coverage": "Coverage: the documentation against the plan",
+    "bug_triage": "Bugs: help with triage",
     "model_trial": "Trial of another model",
     "judge_trial": "Measurement of judges",
     "answer_trial": "Measurement of a second answer",

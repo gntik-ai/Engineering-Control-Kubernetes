@@ -25,6 +25,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { ApiError, apiUrl, postJson, useResource } from '../api';
 import { IssueRef, LoadError, When } from '../parts';
 import { BASE, RouterLink, automationUrl, navigate, queueUrl } from '../router';
+import { BugChecks, BugHelp } from './BugHelp';
 import { BugLinks } from './BugLinks';
 import { BugNumbers, SEVERE, SEVERITIES, type Narrowed, type Severity } from './BugNumbers';
 import { some, whole } from './ChoiceRun';
@@ -705,6 +706,24 @@ function Row({
             Open again
           </Button>
         ) : null}
+        {bug.state === 'draft' ? (
+          <>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => act(`${base}/${bug.id}/publish`, `“${bug.title}” is reported on GitHub, as a bug.`)}
+            >
+              Report on GitHub
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => act(`${base}/${bug.id}/delete`, `The draft “${bug.title}” is deleted.`)}
+            >
+              Delete the draft
+            </Button>
+          </>
+        ) : null}
         {bug.state === 'open' || bug.state === 'draft' ? (
           <Button
             size="sm"
@@ -927,6 +946,8 @@ export function BugsPage({ project }: { project: string }) {
               </CardBody>
             </Card>
           ) : null}
+          <BugHelp project={project} onChanged={done} />
+          {data.can_report ? <BugChecks project={project} onChanged={done} /> : null}
           <BugNumbers project={project} onShow={show} />
           {data.linked ? <BugLinks project={project} onChanged={reload} /> : null}
           <Card id="bug-list" className="scroll-mt-20">

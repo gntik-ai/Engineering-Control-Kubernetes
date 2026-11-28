@@ -15,6 +15,7 @@ from engineering_control.dashboard.auto_checks import AutoChecks
 from engineering_control.dashboard.backlog_items import BacklogItems
 from engineering_control.dashboard.bring_over import BringOver
 from engineering_control.dashboard.bug_section import BugSection
+from engineering_control.dashboard.bug_triage import BugTriage
 from engineering_control.dashboard.bugs import Bugs
 from engineering_control.dashboard.cleanup import Cleanup
 from engineering_control.dashboard.connection_analysis import ConnectionAnalysis
@@ -144,6 +145,7 @@ class DashboardRepository:
         self.orphans = Orphans(self.sessions, self.planning, self.planning_links)
         self.bugs = Bugs(self.sessions, self.planning, self.planning_links)
         self.bug_section = BugSection(self.sessions, self.planning, self.publishing)
+        self.bug_triage = BugTriage(self.sessions, self.bug_section)
         self.primary_epics = PrimaryEpics(self.sessions, self.planning_links)
         self.documents = DocInventory(self.sessions)
         self.signals = Signals(self.sessions, self.planning_links)

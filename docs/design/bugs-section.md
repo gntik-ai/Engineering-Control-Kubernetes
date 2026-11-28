@@ -1,6 +1,6 @@
 # A section for bugs
 
-Proposal, 25 November 2026. Phases B1 and B2 are built (25 November 2026), B3 and B4 on 27 November 2026; B5 is not.
+Proposal, 25 November 2026. **Every phase is built:** B1 and B2 on 25 November 2026, B3 and B4 on 27 November 2026, B5 on 28 November 2026 (each has its "as built" section below).
 
 ## What is asked for
 
@@ -178,7 +178,7 @@ Three rounds at most, as in Deliver issue. The two instructions are settings of 
 - A test added to an existing test file is run with the whole file. The agent is told to write a file of its own.
 - Not exercised on live: no fix has been started there. The flow is covered by a run in tests up to the administrator's decision, with stand-ins for the sandboxes and the workbench.
 
-Added 25 November 2026: [inkling-models.md](inkling-models.md) plans a cheaper model for the reviews. B5's suggestions are one use for it. The flow B3 builds writes code, and keeps the models that write code here: Inkling is not a default for it.
+Added 25 November 2026: [inkling-models.md](inkling-models.md) plans a cheaper model for the reviews. B5's suggestions were one use for it; since the decision of 26 November 2026 that Inkling writes code and reviews nothing, B5 asks the models of Reviews, Settings instead. The flow B3 builds writes code, and keeps the models that write code here: Inkling is not a default for it.
 
 ### B4 as built
 
@@ -217,6 +217,60 @@ A number that counts open bugs has "Show them": the list below is narrowed to ex
 - The alert does not tell a bug that became critical by your own word, and knows no severity GitHub does not carry as a label.
 - "From the report to the fix" counts bugs whose issue was closed as completed, whoever closed it and whether or not a pull request did.
 - Not exercised on live: no critical bug arrived, and no bug was reported from the chat, since that asks the supervisor and creates an issue.
+
+### B5 as built
+
+Built 28 November 2026. It has two parts: help from models with the bugs that are new, and the checks of the default branch.
+
+**Help with triage** (Bugs page, "Help with triage"; `bug_triage.py`; routes under `/api/dashboard/projects/{name}/bugs/triage`). It is a check of the engine that asks the other reviews, called `bug_triage`, so its runs are stopped, resumed and ended, counted and limited as theirs are.
+
+| | What a run does |
+| --- | --- |
+| Asked about | Each bug that is new: open or a draft, with no severity given here and no fix under way. The one that has waited longest is asked about first |
+| Shown with it | Up to six bugs that are open on GitHub: those the ranking service reads as nearest in meaning (0.6 or closer; the page's own "may be the same" wants 0.9, but a model reads these), then those that share half of its words |
+| Sent | The report's title, its text (the first 6,000 characters) and the labels of its issue; the areas the project's bugs are filed under (the 40 most used); of each bug shown with it the title and the first 1,200 characters |
+| Answered | A severity (critical, high, medium, low, or that the report does not say enough) with a passage of the report that shows it; an area, one of those in use or a new name; the bug that reports the same fault, if one does, with a passage of that bug; which of the four parts of a report are not in it; and why, in a sentence or two |
+| Second answer | The judge of the project's settings, a model of another maker, answers the same question without seeing the first answer |
+| When they agree | They gave the same severity and named the same duplicate, or both none. They may still differ on the area or on a missing part: both are shown |
+| When they differ | As the settings say for every review: the first answer goes back once, told what the other said, where rounds are set; a third model is asked where one is named. What still differs is shown as "the two models differ", with both answers and both reasons |
+| Passages | Each is checked word for word against the text it is said to be from. One whose words are not there is marked on the suggestion |
+
+**Nothing is set by a run.** An answer is a suggestion. What you do with one:
+
+| You press | What happens |
+| --- | --- |
+| Confirm with this severity | The bug gets the severity and the area on the row, by the step "Triage" has: the label goes to its issue, and the bug is confirmed. Where the two models agree, their severity and area are filled in and you can change them. Where they differ, no severity is chosen for you |
+| Close as the duplicate of #N | Offered where the suggestion names one. It asks once, then closes the bug by the step "Close" has: on GitHub as not planned, with the comment "Duplicate of #N." |
+| Set aside | The bug stays as it is and the suggestion leaves the list. No run asks about that bug again unless its report is changed |
+
+The tests check it: after a run the bugs are as new as before, no label and no comment reached GitHub.
+
+**Money and limits.**
+
+- The models are those of Reviews, Settings: the one that answers and its judge. **Inkling is never asked**, and no cheaper model is asked first.
+- The project's texts go only to the makers its settings allow.
+- What a run uses is counted with the project's reviews, as "Bugs: help with triage", toward the dollars a month and the review tokens. A run stops at the tokens one run may use.
+- Before you start one the page says how many bugs it would ask about, which models, and what that is likely to cost, from the size of the real questions at the list prices. A run that would pass the month's limit is not started, and says its estimate.
+- **Only you start a run.** It is not among "What starts by itself", and nothing starts it at night or when a bug arrives.
+
+**What is kept.** How each suggestion was decided: confirmed with a severity a model gave, confirmed with another, closed as the duplicate named, or set aside. A line under the list counts them. It is the first measure of how good the suggestions are.
+
+**A failing check becomes a draft bug** (Bugs page, "Checks of the default branch"; `bug_checks.py`; `POST …/bugs/checks`). The plan called this optional; it is built, without a model.
+
+- On your word, the last commit of the project's default branch is looked up, and the checks and statuses GitHub has for it are read, with a token that can read and cannot write.
+- Each that ended badly, and that no open or draft bug stands for, becomes a bug kept here as a draft: "The check “build” fails on main", with what happened, what was expected, where to look on GitHub, and the commit. It is new, and it is not on GitHub.
+- A draft bug has two steps of its own on its row: **Report on GitHub**, which creates its issue with the `bug` label as "Report a bug" does, and **Delete the draft**.
+- Read again, nothing is made twice: the page names the bug that stands for each failing check. Once that bug is closed or its draft deleted, a check that still fails is drafted again.
+
+**Underneath.** No migration. Runs and answers are the engine's (`choice_runs`, `choice_reviews`); how a suggestion was decided is kept with its answer; a draft made from a check is a backlog item that carries the check's name. The engine got one addition: a check whose answers say more than one thing tells in its own words what an answer is told when it goes back.
+
+**What is not in B5, and why.**
+
+- **The checks are not read by themselves.** B5 is help on your word. Reading them on a schedule would make drafts nobody asked for whenever a check is red for an hour.
+- **Only open bugs are offered as duplicates.** A new bug that repeats a closed one is more often a regression than a duplicate, and that is said with "What caused it", by you.
+- **A draft is never offered as the duplicate**, because a duplicate is closed by naming the other bug's number, and a draft has none.
+- **An answer is about the report as it is written.** A bug that arrives later is compared with the earlier ones when it is asked about; the earlier ones are not asked again because it arrived.
+- **A suggestion is one bug at a time.** There is no "take all": several bugs can be given one severity with the list's own selection, as before.
 
 ## What changes underneath
 

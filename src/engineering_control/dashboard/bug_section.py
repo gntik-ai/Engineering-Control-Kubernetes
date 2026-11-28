@@ -1122,6 +1122,45 @@ class BugSection:
                 failed.append({"id": str(key), "detail": str(error)})
         return {"done": done, "failed": failed}
 
+    # ------------------------------------------------------------------- drafts
+
+    def _draft_of(self, db: Session, project: ProjectRecord, key: UUID) -> BacklogItem:
+        item = db.get(BacklogItem, key)
+        if (
+            item is None
+            or item.project_id != project.id
+            or item.id not in {row.id for row in _bugs(db, project)}
+        ):
+            raise ProjectNotFound(str(key))
+        if _stands(item) != "draft":
+            raise ProjectConflict(
+                "This bug is no draft: it is on GitHub, is being created there, or is closed."
+            )
+        return item
+
+    def _to_github(self, name: str, key: UUID) -> UUID:
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            item = self._draft_of(db, project, key)
+            if not project.source_repository:
+                raise ProjectInvalid("This project has no repository to report a bug in.")
+            item.workspace_review = "publishing"
+            return enqueue(db, project.id, "create", item.id, project.source_repository).id
+
+    async def publish(self, name: str, key: UUID, github: GitHubApp | None) -> dict[str, Any]:
+        """Report a bug that is kept here as a draft: its issue is created on GitHub now,
+        with the ``bug`` label, as a bug that is reported from here is."""
+        action = await asyncio.to_thread(self._to_github, name, key)
+        result = await self.publishing.sync(name, action, github)
+        return {"id": str(key), **result}
+
+    def delete_draft(self, name: str, key: UUID) -> dict[str, Any]:
+        """Delete a bug that is kept here as a draft. It was never on GitHub."""
+        with self.sessions() as db:
+            self._draft_of(db, active_project(db, name), key)
+        impact = self.planning.lifecycle.preview(name, "issues", key, "delete")
+        return self.planning.lifecycle.confirm(name, "issues", key, "delete", impact["token"])
+
     async def reopen(self, name: str, key: UUID, github: GitHubApp | None) -> dict[str, Any]:
         """Open a closed bug again, on GitHub and here."""
         repository, number, _title, _held, state = await asyncio.to_thread(
