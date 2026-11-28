@@ -13,10 +13,11 @@ import {
 import type { ComponentType } from 'react';
 import { apiUrl, useResource, type Inbox, type InboxEntry } from '../api';
 import { LoadError, RefreshButton } from '../parts';
-import { BASE, RouterLink, accountsUrl, queueUrl } from '../router';
+import { BASE, RouterLink, accountsUrl, queueUrl, reviewUrl } from '../router';
 import { Proposal } from '../supervisor';
 
-const plural = (count: number, one: string, many: string) => `${count.toLocaleString('en')} ${count === 1 ? one : many}`;
+const plural = (count: number, one: string, many: string) =>
+  `${count.toLocaleString('en')} ${count === 1 ? one : many}`;
 
 interface Shown {
   icon: ComponentType<{ className?: string }>;
@@ -113,6 +114,16 @@ function shown(entry: InboxEntry): Shown {
         action: entry.run_id ? 'Open the run' : 'Open the supervisor',
         href: entry.run_id ? `${BASE}/run?id=${entry.run_id}` : `${BASE}/supervisor`,
       };
+    case 'review_cases':
+      return {
+        icon: ListChecks,
+        tone: 'neutral',
+        label: 'Needs you',
+        title: `${plural(entry.count, 'case waits', 'cases wait')} for you under ${entry.page === 'coverage' ? 'Coverage' : 'Organize'} of ${entry.project_name}`,
+        detail: 'What a run could not settle by itself. Nothing of it is applied until you say so.',
+        action: entry.page === 'coverage' ? 'Open Coverage' : 'Open Organize',
+        href: entry.project ? reviewUrl(entry.project, entry.page === 'coverage' ? 'coverage' : 'organize') : BASE,
+      };
     case 'sync_failed':
       return {
         icon: CircleAlert,
@@ -203,7 +214,11 @@ export function InboxPage() {
             ))
           : !inbox.error && Array.from({ length: 4 }, (_, index) => <Skeleton key={index} className="h-20 w-full" />)}
         {entries?.length === 0 ? (
-          <EmptyState icon={CircleCheck} title="Nothing is waiting for you" description="Every item has a section and a decision, every section with work has a flow, and every backlog was read." />
+          <EmptyState
+            icon={CircleCheck}
+            title="Nothing is waiting for you"
+            description="Every item has a section and a decision, every section with work has a flow, and every backlog was read."
+          />
         ) : null}
       </div>
     </Page>

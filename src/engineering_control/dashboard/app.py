@@ -519,6 +519,9 @@ def create_app(
             await asyncio.sleep(300)
             try:
                 started = await asyncio.to_thread(records.auto_checks.start_due)
+                # The runs of Organize and Coverage, where the settings say they start
+                # by themselves: as records and documents arrive, or once a night.
+                started += await asyncio.to_thread(records.organize_auto.start_due)
                 if started:
                     said = ", ".join(f"{name}/{kind}" for name, kind in started)
                     log_recovery("checks-by-themselves", f"Started by themselves: {said}")
@@ -534,6 +537,8 @@ def create_app(
                 await asyncio.to_thread(records.organize_issues.tick)
                 await asyncio.to_thread(records.organize_epics.tick)
                 await asyncio.to_thread(records.coverage.tick)
+                # What a run that started by itself left to do is noted as it ends.
+                await asyncio.to_thread(records.organize_auto.settle)
             except Exception as error:  # noqa: BLE001 - tried again at the next pass
                 log_failure("organize", "A run of Organize could not be carried on", error)
 
@@ -2264,6 +2269,12 @@ def create_app(
         """Where one project's reorganization stands, and what moved since the day before."""
         return await documents_read(request, lambda: repo(request).rollout.status(name))
 
+    @app.get("/api/dashboard/projects/{name}/reviews/by-itself")
+    async def reviews_by_itself_api(name: str, request: Request) -> Response:
+        """For each run of Organize and Coverage: whether it starts by itself in the
+        project, and what a start now would wait for."""
+        return await documents_read(request, lambda: repo(request).organize_auto.standings(name))
+
     @app.get("/api/dashboard/projects/{name}/reviews/waiting")
     async def reviews_waiting_api(name: str, request: Request) -> Response:
         """How many cases wait on each page of Reviews: the count beside its menu entry."""
@@ -2849,6 +2860,17 @@ def create_app(
                 body.writer(),
             ),
             event="project.review_settings_changed",
+            subject=name,
+        )
+
+    @app.post("/api/dashboard/projects/{name}/review-settings/put-back")
+    async def review_settings_put_back_api(name: str, request: Request) -> Response:
+        """Put the models back as they were before they were last changed."""
+        return await project_change(
+            request,
+            PlainChangeInput,
+            lambda _: asyncio.to_thread(repo(request).review_settings.put_back, name),
+            event="project.review_models_put_back",
             subject=name,
         )
 

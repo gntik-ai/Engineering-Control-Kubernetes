@@ -38,6 +38,9 @@ EVERY: Final = timedelta(minutes=30)
 NIGHT: Final = (1, 5)
 # A record a model gave no usable answer about is not asked again by itself before this.
 RETRY: Final = timedelta(hours=24)
+# The checks a run of Organize asks. They are not started by themselves on their own
+# any more: the run is, where the settings say so, and it gathers what they answer.
+BY_RUN: Final = frozenset({"issue_story", "story_epic", "epic_links"})
 
 
 def _aware(moment: datetime) -> datetime:
@@ -162,7 +165,7 @@ class AutoChecks:
                     .order_by(ProjectRecord.name)
                 )
                 for kind, mode in (runs or {}).items()
-                if mode in MODES[1:] and kind in self.starters
+                if mode in MODES[1:] and kind in self.starters and kind not in BY_RUN
             ]
 
     def start_due(self, now: datetime | None = None) -> list[tuple[str, str]]:

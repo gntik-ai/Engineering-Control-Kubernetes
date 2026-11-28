@@ -32,6 +32,7 @@ import { OrganizeBefore } from './OrganizeBefore';
 import { ReviewCounts } from './ReviewCounts';
 import { Organize } from './Organize';
 import { Coverage, OnGitHub } from './Coverage';
+import { ByItself } from './ByItself';
 import { WorkspaceImport } from './WorkspaceImport';
 
 const automationTitles = { flows: 'Flows', flow: 'Flow designer', operations: 'Operations', assignments: 'Flow assignment', agents: 'Agents', commands: 'Commands' };
@@ -197,6 +198,7 @@ export function ProjectWorkspace({
                 <h1 className="text-2xl font-semibold tracking-tight">{reviewMenu[view].label}</h1>
                 {view === 'organize' && <Organize project={project.project} />}
                 {view === 'coverage' && <Coverage project={project.project} />}
+                {view === 'coverage' && <ByItself project={project.project} kind="coverage" />}
                 {view === 'organize' && <OrganizeBefore project={project.project} />}
                 {view === 'coverage' && (
                   <Anchor id="first-plan">

@@ -22,7 +22,7 @@ type ReviewPage = {
   review_budget?: ReviewBudget;
   status_labels?: Record<string, string>;
   usage_24h?: { requests: number; tokens: number };
-  paused: boolean; counts: Record<string, number>; page: number; pages: number;
+  paused: boolean; by_runs?: boolean; counts: Record<string, number>; page: number; pages: number;
   provider: string | null; model: string | null; models: { provider: string; model: string }[];
   items: (RecordLink & ReviewResult)[];
 };
@@ -107,6 +107,7 @@ export function PlanningReviews({ project }: { project: string }) {
     <h3 className="font-semibold">Automatic planning reviews</h3>
     {data && <p className="text-sm text-muted-foreground">{data.paused ? 'Stopped' : 'Running'}{data.model ? ' · ' + data.model + (data.provider ? ' · ' + data.provider : '') : ' · no model chosen'}</p>}
     {data?.usage_24h && <p className="text-sm text-muted-foreground">Automatic review in the last 24 hours · {data.usage_24h.requests.toLocaleString()} recorded model calls · {data.usage_24h.tokens.toLocaleString()} tokens</p>}
+    {data?.by_runs && <p role="status" className="text-sm">A run of Organize starts by itself in this project and organizes the records that arrive: these reviews are not asked. Those that asked a question before can still be answered below.</p>}
     {data?.paused && <p role="status" className="text-sm">Stopped · {(data.counts.queued ?? 0).toLocaleString()} queued for this project.</p>}
     <LoadError resource={resource} />
     {data && <>

@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import review_budget, review_flows
+from engineering_control.dashboard import organize_auto, review_budget, review_flows
 from engineering_control.dashboard.backlog_items import clean_description, clean_title
 from engineering_control.dashboard.connection_records import digest
 from engineering_control.dashboard.issue_coverage import Coverage, IssueCoverage
@@ -205,6 +205,9 @@ class PlanningAnalysis:
         j = PlanningReview
         with self.sessions.begin() as db:
             occupied = select(j.project_id).where(j.status == "running", j.due_at > now)
+            # Where a run of Organize starts by itself, it organizes the records that
+            # arrive: they are not reviewed one by one as well.
+            by_runs = organize_auto.organized_projects(db)
             first = db.execute(
                 select(j.project_id, j.kind, j.record_id, ProjectRecord.name)
                 .join(ProjectRecord, ProjectRecord.id == j.project_id)
@@ -227,6 +230,7 @@ class PlanningAnalysis:
                     ProjectRecord.planning_reviews_paused_at.is_(None),
                     ProjectRecord.id.not_in(review_budget.held_projects()),
                     func.coalesce(ProjectRecord.planning_model, WorkspaceImport.model).is_not(None),
+                    *((ProjectRecord.id.not_in(by_runs),) if by_runs else ()),
                 )
                 .order_by(j.due_at, j.created_at, j.record_id)
                 .limit(1)
@@ -787,6 +791,8 @@ class PlanningAnalysis:
                 "provider": provider,
                 "model": model,
                 "paused": bool(p.planning_reviews_paused_at),
+                # A run of Organize starts by itself here and organizes new records.
+                "by_runs": organize_auto.organized(db, p.id),
                 "counts": counts,
                 "status_labels": {s: REVIEW_STATUS_LABELS.get(s, s) for s in counts},
                 "usage_24h": usage,

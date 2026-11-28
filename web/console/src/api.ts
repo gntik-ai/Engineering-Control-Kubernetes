@@ -714,7 +714,10 @@ export interface InboxEntry {
     | 'sync_failed'
     | 'section_without_flow'
     | 'unrouted'
-    | 'undecided';
+    | 'undecided'
+    | 'review_cases';
+  /** For cases a run of Organize or Coverage put before the administrator: the page. */
+  page?: 'organize' | 'coverage';
   /** For a queue the supervisor proposed, or one the platform paused. */
   queue_id?: string;
   queue?: string;

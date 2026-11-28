@@ -905,7 +905,32 @@ class Toolbox:
             + self.pending()
             + queued
             + self.backlog.inbox()
+            + self._review_cases()
         )
+
+    def _review_cases(self) -> list[dict[str, Any]]:
+        """The cases the runs of Organize and Coverage put before the administrator:
+        one entry for each page of a project that holds some. They wait and stop
+        nothing, so they come last."""
+        from engineering_control.dashboard import organize_auto
+
+        found = []
+        with self.sessions() as db:
+            for record in self.projects.active():
+                for page, count in organize_auto.waiting(db, record.id).items():
+                    if count:
+                        found.append(
+                            {
+                                "kind": "review_cases",
+                                "project": record.name,
+                                "project_name": record.display_name,
+                                "section": None,
+                                "count": count,
+                                "page": page.lower(),
+                                "detail": f"What a run of {page} could not settle.",
+                            }
+                        )
+        return found
 
     # --- changing ------------------------------------------------------------------------
 

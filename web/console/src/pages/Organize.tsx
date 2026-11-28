@@ -1,4 +1,5 @@
 import { Anchor } from './Anchor';
+import { ByItself } from './ByItself';
 import { Alert, Badge, Button, Card, CardBody, CardHeader, CardTitle, Link, Skeleton } from '@gntik-ai/ui';
 import { useEffect, useState } from 'react';
 import { apiUrl, postJson, useResource } from '../api';
@@ -469,9 +470,15 @@ export function Organize({ project }: { project: string }) {
       </p>
       <Anchor id="epics-stories">
         <EpicsAndStories project={project} />
+        <div className="px-1 pt-2">
+          <ByItself project={project} kind="epics_stories" />
+        </div>
       </Anchor>
       <Anchor id="stories-issues">
         <StoriesAndIssues project={project} />
+        <div className="px-1 pt-2">
+          <ByItself project={project} kind="stories_issues" />
+        </div>
       </Anchor>
     </>
   );

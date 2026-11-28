@@ -291,6 +291,7 @@ def test_dashboard_exposes_only_typed_mutations_and_no_raw_journal_route(
         "/api/dashboard/projects/{name}/epic-links/runs",
         "/api/dashboard/projects/{name}/epic-links/runs/{run_id}/control",
         "/api/dashboard/projects/{name}/review-settings",
+        "/api/dashboard/projects/{name}/review-settings/put-back",
         "/api/dashboard/projects/{name}/judge-trials/{kind}/runs",
         "/api/dashboard/projects/{name}/judge-trials/{kind}/runs/{run_id}/control",
         "/api/dashboard/projects/{name}/model-trials/{check}/runs",

@@ -1337,6 +1337,11 @@ class ReviewSettings(UUIDPrimaryKey, Timestamps, Base):
     # model that answers.
     writer_provider: Mapped[str | None] = mapped_column(String(32))
     writer_model: Mapped[str | None] = mapped_column(String(200))
+    # Since when each stage is as it is (migration 0099): "decision" for the model that
+    # answers and the judge, "writing" for the model that writes and the one that checks.
+    # Each holds the models as a key, the moment they were set, and what was set before.
+    # None where nothing was changed yet: the record of a stage then counts everything.
+    stages: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
 class ModelTrialLine(UUIDPrimaryKey, Timestamps, Base):

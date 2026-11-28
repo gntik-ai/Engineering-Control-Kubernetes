@@ -30,7 +30,15 @@ interface Listed {
   planned: boolean;
   rows: Row[];
   counts: Record<Group, number>;
-  lately: { runs?: number; answers?: number; dollars?: number; moved?: Moved[]; before?: string | null };
+  lately: {
+    runs?: number;
+    answers?: number;
+    dollars?: number;
+    moved?: Moved[];
+    before?: string | null;
+    /** What the runs of Organize and Coverage did by themselves in the last day. */
+    organized?: { runs: number; done: number; created: number; needs: number; dollars: number };
+  };
   computed_at: string;
 }
 
@@ -171,6 +179,11 @@ export function NeedsYou({ project }: { project: string }) {
             <CardTitle>What happened without you</CardTitle>
           </CardHeader>
           <CardBody className="grid gap-2 text-sm">
+            <p className="text-foreground">
+              {lately.organized?.runs
+                ? `In the last day ${some(lately.organized.runs, 'run of Organize or Coverage', 'runs of Organize and Coverage')} started by ${lately.organized.runs === 1 ? 'itself' : 'themselves'}: ${whole(lately.organized.done)} applied, ${whole(lately.organized.created)} created, ${whole(lately.organized.needs)} put before you, for $${lately.organized.dollars.toFixed(2)}.`
+                : 'No run of Organize or Coverage started by itself in the last day.'}
+            </p>
             <p className="text-foreground">
               {lately.runs
                 ? `In the last day the checks started by themselves ${some(lately.runs, 'time', 'times')} and gave ${some(lately.answers ?? 0, 'answer', 'answers')}, for $${(lately.dollars ?? 0).toFixed(2)}.`

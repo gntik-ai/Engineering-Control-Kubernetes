@@ -216,6 +216,10 @@ RECORD: Final = 100
 ORGANIZED: Final = frozenset({"primary", "place", "unsupported", "extra_epics", "close"})
 
 
+def _aware(moment: datetime) -> datetime:
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
 def alone_standing(db: Session, project: UUID, kind: str) -> dict[str, Any]:
     """How far that kind of change goes without the administrator in this project, and
     the record that decides it: the sampled lines of its batches the administrator
@@ -224,16 +228,23 @@ def alone_standing(db: Session, project: UUID, kind: str) -> dict[str, Any]:
     what the settings accept, and not too many lines applied before wait to be judged."""
     mine = review_settings.of(db, project)
     rows = db.execute(
-        select(ReorgLine.verdict, ReorgBatch.state, ReorgBatch.alone)
+        select(ReorgLine.verdict, ReorgBatch.state, ReorgBatch.alone, ReorgLine.updated_at)
         .join(ReorgBatch, ReorgBatch.id == ReorgLine.batch_id)
         .where(ReorgLine.project_id == project, ReorgBatch.kind == kind, ReorgLine.sampled)
         .order_by(ReorgLine.updated_at.desc(), ReorgLine.id)
     ).all()
-    judged = [verdict for verdict, _state, _alone in rows if verdict in ("right", "wrong")][:RECORD]
+    # What was judged before the models that decide were changed says nothing of those
+    # that decide now: the record starts anew with them.
+    since = mine.stage_since("decision")
+    judged = [
+        verdict
+        for verdict, _state, _alone, at in rows
+        if verdict in ("right", "wrong") and (since is None or _aware(at) >= since)
+    ][:RECORD]
     wrong = sum(1 for verdict in judged if verdict == "wrong")
     waiting = sum(
         1
-        for verdict, state, alone in rows
+        for verdict, state, alone, _at in rows
         if alone and state == "approved" and verdict not in ("right", "wrong")
     )
     needed, accepted = mine.count("alone_from"), error_of(db, project, kind)
@@ -242,7 +253,9 @@ def alone_standing(db: Session, project: UUID, kind: str) -> dict[str, Any]:
     if len(judged) < needed:
         why = (
             f"You judged {len(judged):,} sampled {'line' if len(judged) == 1 else 'lines'} of "
-            f"these batches; applying without you begins after {needed:,}."
+            f"these batches"
+            + (" since the models that decide were changed" if since is not None else "")
+            + f"; applying without you begins after {needed:,}."
         )
     elif wrong > accepted * len(judged):
         why = (

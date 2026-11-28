@@ -47,6 +47,21 @@ interface Settings {
     why: string;
     waiting: number;
   }[];
+  /** The record of each stage since its models were set, and what was set before. */
+  stages: {
+    stage: 'decision' | 'writing';
+    label: string;
+    since: string | null;
+    counted: number;
+    wrong: number;
+    accepted: number;
+    worse: boolean;
+    says: string;
+    /** Whether the last change of the models changed this stage. */
+    changed: boolean;
+  }[];
+  /** The models as they were before the last change, where it can be put back. */
+  models_before: Record<string, [string, string] | null> | null;
   checks: {
     check: string;
     label: string;
@@ -161,6 +176,11 @@ export function ReviewSettings({ project }: { project: string }) {
       })
       .catch((error: unknown) => setProblem(error instanceof Error ? error.message : 'The request failed.'))
       .finally(() => setBusy(null));
+  };
+  // After the models were put back, the form is filled again from what is saved.
+  const reloadAll = () => {
+    filled.current = null;
+    settings.reload();
   };
   const pick = (key: string) => (key ? (JSON.parse(key) as [string, string]) : ['', '']);
   const save = () => {
@@ -536,6 +556,54 @@ export function ReviewSettings({ project }: { project: string }) {
                 applied is put before you afterwards; a line you judge wrong is put back, and when the record no longer
                 holds, applying stops by itself.
               </p>
+              <section className="grid gap-2 rounded-lg border border-border p-3" aria-label="The record of each stage">
+                <h3 className="text-sm font-semibold text-foreground">Measured again when it changes</h3>
+                <p className="text-sm text-muted-foreground">
+                  When you change the models of a stage, what was judged or made with the models before says nothing of
+                  the new ones: the record starts anew, and until it holds again nothing of that stage is applied
+                  without you. A stage that does worse with the new models than you accept can be put back as it was.
+                </p>
+                {data.stages.map((entry) => (
+                  <div key={entry.stage} className="grid gap-1 text-sm">
+                    <span className="font-medium text-foreground">{entry.label}</span>
+                    <span className="text-muted-foreground">
+                      {entry.since
+                        ? `Changed ${new Date(entry.since).toLocaleString('en')}. Since then: `
+                        : 'Not changed since its record began. On record: '}
+                      {whole(entry.counted)} {entry.says.split(',')[0]}, {whole(entry.wrong)}{' '}
+                      {entry.stage === 'decision' ? 'of them wrong' : 'of them taken away again'}; you accept{' '}
+                      {entry.accepted}%.
+                      {entry.worse
+                        ? ' That is worse than you accept: nothing of this stage is applied without you.'
+                        : ''}
+                    </span>
+                  </div>
+                ))}
+                {data.models_before ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant={data.stages.some((entry) => entry.changed && entry.worse) ? 'primary' : 'secondary'}
+                      loading={busy === 'back'}
+                      onClick={() => act('back', () => postJson(base + '/review-settings/put-back', {}), reloadAll)}
+                    >
+                      Put the models back as they were
+                    </Button>
+                    <span className="text-xs text-muted-foreground">
+                      Before the last change:{' '}
+                      {[
+                        ['answers', data.models_before.answer],
+                        ['judges', data.models_before.judge],
+                        ['writes', data.models_before.writer],
+                      ]
+                        .filter((entry): entry is [string, [string, string]] => Boolean(entry[1]))
+                        .map(([role, named]) => `${named[1]} ${role}`)
+                        .join(', ') || 'no model was set'}
+                      . The record they had counts again.
+                    </span>
+                  </div>
+                ) : null}
+              </section>
               {data.alone.map((entry) => (
                 <div key={entry.kind} className="grid gap-1">
                   <label className="grid gap-1 text-sm sm:max-w-md">
@@ -569,15 +637,18 @@ export function ReviewSettings({ project }: { project: string }) {
           </Card>
           <Card>
             <CardHeader>
-              <CardTitle>Which checks run by themselves</CardTitle>
+              <CardTitle>What starts by itself</CardTitle>
             </CardHeader>
             <CardBody className="grid gap-4">
               <p className="text-sm text-muted-foreground">
-                A check that runs by itself is started over the records that have no answer, with the models chosen
-                above, and stops at this project’s limits like a run you start. As records arrive means within half an
-                hour of a record without an answer; each night means once, between 1 and 5 UTC. A record no model could
-                answer is not asked about again for a day. None runs by itself unless you say so here: asking a model
-                costs money.
+                A run of Organize or of Coverage that starts by itself is the run its button starts: it organizes the
+                records and documents that arrived since, with the models chosen above, applies only what this page lets
+                it apply without you, puts the rest before you, and stops at this project’s limits. As records arrive
+                means within half an hour of something for it to do; each night means once, between 1 and 5 UTC. A run
+                estimated to pass the month’s limit is not started by itself: it waits for your word. A run that left as
+                much to do as it found is not started again for a day. Where a run of Organize starts by itself, new
+                records are organized by it and not reviewed one by one. Nothing starts by itself unless you say so
+                here: asking a model costs money.
               </p>
               <div className="grid gap-3 sm:grid-cols-2">
                 {data.runs.map((entry) => (
@@ -585,11 +656,11 @@ export function ReviewSettings({ project }: { project: string }) {
                     <label className="grid gap-1 text-sm">
                       {entry.label}
                       <SimpleSelect
-                        aria-label={`When “${entry.label}” runs by itself`}
+                        aria-label={`When “${entry.label}” starts by itself`}
                         value={runs[entry.check] ?? 'off'}
                         items={[
                           { value: 'off', label: 'Only when you start it' },
-                          { value: 'arrive', label: 'By itself, as records arrive' },
+                          { value: 'arrive', label: 'By itself, as records and documents arrive' },
                           { value: 'night', label: 'By itself, each night' },
                         ]}
                         onValueChange={(value) => setRuns({ ...runs, [entry.check]: String(value ?? 'off') })}
@@ -599,7 +670,7 @@ export function ReviewSettings({ project }: { project: string }) {
                       <p className="text-sm text-muted-foreground">
                         {entry.due
                           ? `${whole(entry.waiting)} ${entry.waiting === 1 ? 'record waits' : 'records wait'}: it starts within five minutes.`
-                          : entry.why}
+                          : entry.why || 'It starts within five minutes of something for it to do.'}
                       </p>
                     ) : null}
                   </div>

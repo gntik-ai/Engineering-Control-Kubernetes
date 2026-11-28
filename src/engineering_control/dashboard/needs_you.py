@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from engineering_control.dashboard import (
     auto_checks,
     evidence_verdicts,
+    organize_auto,
     parent_choice,
     reorg,
     review_settings,
@@ -379,7 +380,12 @@ def _checks(db: Session, project: ProjectRecord, lines: dict[str, int]) -> list[
                 )
             )
         elif unasked and (run is None or run.state not in parent_choice.LIVE):
-            mode = auto_checks.standing(db, project, kind)
+            mode = (
+                # A check a run of Organize asks starts by itself where the run does.
+                organize_auto.standing(db, project, organize_auto.TAKES[kind])
+                if kind in organize_auto.TAKES
+                else auto_checks.standing(db, project, kind)
+            )
             if mode["mode"] == "off" and kind == "story_needed":
                 # It has no button of its own: the Issues of a User Story that has
                 # none are written, or the Story put before the administrator, by
@@ -458,6 +464,10 @@ def _planning_reviews(db: Session, project: ProjectRecord) -> list[dict[str, Any
                 "Each says why, and can be tried again.",
             )
         )
+    if queued and organize_auto.organized(db, project.id):
+        # A run of Organize starts by itself and organizes new records: the reviews of
+        # single records are not asked, and nothing waits on them.
+        queued = 0
     if queued:
         provider, model = selection(project, db.get(WorkspaceImport, project.id))
         why = (
@@ -681,6 +691,8 @@ def _lately(db: Session, project: ProjectRecord, now: datetime) -> dict[str, Any
             sum(float(part or 0.0) for _done, *costs in runs for part in costs),
             4,
         ),
+        # What the runs of Organize and Coverage did by themselves in the last day.
+        "organized": organize_auto.lately(db, project.id, now - timedelta(days=1)),
         "moved": (moved or {}).get("moved", []),
         "before": (moved or {}).get("before"),
         "measured": (moved or {}).get("day"),

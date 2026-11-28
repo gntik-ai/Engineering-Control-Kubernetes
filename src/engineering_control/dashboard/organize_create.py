@@ -321,16 +321,22 @@ class Creator:
     def creating(db: Session, project: UUID) -> dict[str, Any]:
         """Whether records are made without the administrator: not where more of those
         made were taken away again than the settings accept."""
+        mine = review_settings.of(db, project)
+        # What was made before the models that write and check were changed says nothing
+        # of those that do now: the record starts anew with them.
+        since = mine.stage_since("writing")
         counted = {"applied": 0, "undone": 0}
         for state in db.scalars(
             select(OrganizeLine.state).where(
-                OrganizeLine.project_id == project, OrganizeLine.listed == "created"
+                OrganizeLine.project_id == project,
+                OrganizeLine.listed == "created",
+                *((OrganizeLine.created_at >= since,) if since is not None else ()),
             )
         ):
             if state in counted:
                 counted[state] += 1
         made = counted["applied"] + counted["undone"]
-        accepted = review_settings.of(db, project).share("add_error")
+        accepted = mine.share("add_error")
         over = bool(counted["undone"]) and counted["undone"] / made > accepted
         return {
             "in_force": not over,

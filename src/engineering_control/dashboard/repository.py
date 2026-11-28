@@ -30,6 +30,7 @@ from engineering_control.dashboard.judging import Judging
 from engineering_control.dashboard.model_trials import ModelTrials
 from engineering_control.dashboard.needs_you import NeedsYou
 from engineering_control.dashboard.organize import Organize
+from engineering_control.dashboard.organize_auto import AutoRuns
 from engineering_control.dashboard.organize_create import Creator
 from engineering_control.dashboard.organize_epics import EpicsRun
 from engineering_control.dashboard.organize_issues import IssuesRun
@@ -197,6 +198,16 @@ class DashboardRepository:
             self.organize_create,
         )
         self.coverage = CoverageRun(self.sessions, self.organize_create)
+        # The runs that start by themselves start as their buttons start them.
+        self.organize_auto = AutoRuns(
+            self.sessions,
+            {
+                "epics_stories": self.organize_epics,
+                "stories_issues": self.organize_issues,
+                "coverage": self.coverage,
+            },
+            self.connections,
+        )
         self.rollout = Rollout(self.sessions, self.planning_links, self.needs_you)
         self.sections = SectionRecords(self.sessions)
         self.backlog = BacklogItems(self.sessions)

@@ -25,7 +25,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from engineering_control.dashboard import review_flows
-from engineering_control.dashboard.project_records import ProjectInvalid, active_project
+from engineering_control.dashboard.project_records import (
+    ProjectConflict,
+    ProjectInvalid,
+    active_project,
+)
 from engineering_control.db.models import ReviewSettings, WorkspaceImport, WorkspaceModelUsage
 from engineering_control.models.providers import family_of, maker
 
@@ -210,6 +214,17 @@ class Settings:
     runs: Mapping[str, str] = field(default_factory=dict)
     # The model that writes a record that is missing; none for the model that answers.
     writer: tuple[str, str] | None = None
+    # Since when each stage is as it is, and what it was before: see ``STAGES``.
+    stages: Mapping[str, Any] = field(default_factory=dict)
+
+    def stage_since(self, stage: str) -> datetime | None:
+        """Since when the models of a stage are those they are: what was judged or made
+        before says nothing of them. None where they were never changed."""
+        said = (self.stages.get(stage) or {}).get("since")
+        if not said:
+            return None
+        moment = datetime.fromisoformat(str(said))
+        return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
     def goes(self, kind: str) -> str:
         """ "off", "propose" or "apply" for that kind of batch; proposing unless set."""
@@ -247,7 +262,104 @@ def of(db: Session, project: UUID) -> Settings:
         dict(row.alone or {}),
         dict(row.runs or {}),
         (row.writer_provider or "", row.writer_model) if row.writer_model else None,
+        dict(row.stages or {}),
     )
+
+
+# The stages whose record starts anew when their models change: which roles make each,
+# and what it is called.
+STAGES: Final = {
+    "decision": (("answer", "judge"), "The model that answers and the judge"),
+    "writing": (("writer", "answer", "judge"), "The model that writes and the one that checks"),
+}
+
+
+def _named(row: ReviewSettings) -> dict[str, list[str] | None]:
+    return {
+        "answer": [row.answer_provider or "", row.answer_model] if row.answer_model else None,
+        "judge": [row.judge_provider or "", row.judge_model] if row.judge_model else None,
+        "writer": [row.writer_provider or "", row.writer_model] if row.writer_model else None,
+    }
+
+
+def _stage_key(named: Mapping[str, Any], stage: str) -> str:
+    return "|".join("/".join(named.get(role) or ["", ""]) for role in STAGES[stage][0])
+
+
+def stages_shown(db: Session, project: UUID, mine: Settings) -> list[dict[str, Any]]:
+    """For each stage: since when its models are those they are, the record it has since
+    then, and whether that record is worse than the settings accept. A stage whose
+    models were changed and that does worse since can be put back as it was."""
+    from engineering_control.dashboard import reorg
+    from engineering_control.dashboard.organize_create import Creator
+
+    alone = [reorg.alone_standing(db, project, kind) for kind in reorg.ALONE]
+    judged, wrong = sum(e["judged"] for e in alone), sum(e["wrong"] for e in alone)
+    creating = Creator.creating(db, project)
+    records = {
+        "decision": {
+            "counted": judged,
+            "wrong": wrong,
+            "accepted": round(mine.share("add_error") * 100, 1),
+            "worse": bool(judged) and wrong > mine.share("add_error") * judged,
+            "says": "sampled lines you judged, and how many of them wrong",
+        },
+        "writing": {
+            "counted": creating["made"],
+            "wrong": creating["undone"],
+            "accepted": creating["accepted"],
+            "worse": not creating["in_force"],
+            "says": "records that were made, and how many of them taken away again",
+        },
+    }
+    found = []
+    for stage, (_roles, label) in STAGES.items():
+        kept = mine.stages.get(stage) or {}
+        found.append(
+            {
+                "stage": stage,
+                "label": label,
+                "since": kept.get("since"),
+                **records[stage],
+                # Whether the last change of the models changed this stage: the change
+                # can be put back.
+                "changed": bool(kept.get("before")),
+            }
+        )
+    return found
+
+
+def _restage(row: ReviewSettings, before: dict[str, list[str] | None], now: datetime) -> None:
+    """Where the models of a stage are other than they were, its record starts anew
+    from now. What every model was before this change is kept, so that the change can
+    be put back as a whole."""
+    after = _named(row)
+    stages = dict(row.stages or {})
+    changed = [s for s in STAGES if _stage_key(before, s) != _stage_key(after, s)]
+    if not changed:
+        return
+    held = False
+    for stage in STAGES:
+        earlier = dict(stages.get(stage) or {})
+        if stage not in changed:
+            # Only what the last change changed can be put back.
+            earlier.pop("before", None)
+            if earlier:
+                stages[stage] = earlier
+            continue
+        entry: dict[str, Any] = {"key": _stage_key(after, stage), "since": None}
+        if any(before.get(role) for role in STAGES[stage][0]):
+            # It had models before: what was judged or made with them says nothing of
+            # the new ones.
+            entry["since"] = now.isoformat()
+            entry["before"] = {"key": _stage_key(before, stage), "since": earlier.get("since")}
+            held = True
+        stages[stage] = entry
+    if held:
+        stages["before"] = dict(before)
+    else:
+        stages.pop("before", None)
+    row.stages = stages or None
 
 
 def number(db: Session, project: UUID, key: str) -> float:
@@ -455,7 +567,12 @@ class ReviewSettingsService:
             for entry in review_flows.decision_models(db):
                 offered.setdefault(maker(entry["provider"], entry["model"]), 0)
             defaults = default_makers(db)
-            from engineering_control.dashboard import auto_checks, parent_choice, reorg
+            from engineering_control.dashboard import (
+                auto_checks,
+                organize_auto,
+                parent_choice,
+                reorg,
+            )
             from engineering_control.dashboard.planning_analysis import selection
 
             # The model those reviews ask: the one chosen for planning, else Discovery's.
@@ -497,15 +614,27 @@ class ReviewSettingsService:
                 # How far each kind of change goes without the administrator, with the
                 # record that decides whether applying is in force.
                 "alone": [reorg.alone_standing(db, project.id, kind) for kind in reorg.ALONE],
-                # Which checks run by themselves, and what each waits for now.
+                # What runs by itself, and what each waits for now: the runs of Organize
+                # and Coverage, and the checks no run asks.
                 "runs": [
-                    {
-                        **auto_checks.standing(db, project, kind, datetime.now(UTC)),
-                        "label": label,
-                    }
-                    for kind, label in parent_choice.CHECKS.items()
-                    if kind in parent_choice.KINDS
+                    *(
+                        organize_auto.standing(db, project, kind, datetime.now(UTC))
+                        for kind in organize_auto.RUNS
+                    ),
+                    *(
+                        {
+                            **auto_checks.standing(db, project, kind, datetime.now(UTC)),
+                            "label": label,
+                        }
+                        for kind, label in parent_choice.CHECKS.items()
+                        if kind in parent_choice.KINDS and kind not in auto_checks.BY_RUN
+                    ),
                 ],
+                # The record of each stage since its models were set, and whether going
+                # back to the models before is offered.
+                "stages": stages_shown(db, project.id, mine),
+                # The models as they were before the last change, where it can be put back.
+                "models_before": mine.stages.get("before") or None,
                 "makers": [
                     {
                         "maker": made_by,
@@ -566,6 +695,7 @@ class ReviewSettingsService:
                 db.add(row)
             row.makers = sorted(set(allowed)) if allowed is not None else None
             db.flush()
+            before = _named(row)
             offered = models(db, project.id)
             for role, what in (
                 (answer, "The model that answers"),
@@ -603,13 +733,46 @@ class ReviewSettingsService:
                     raise ProjectInvalid("That is not a way a change can go on.")
                 row.alone = {k: v for k, v in alone.items() if v != "propose"} or None
             if runs is not None:
-                from engineering_control.dashboard import auto_checks, parent_choice
+                from engineering_control.dashboard import auto_checks, organize_auto, parent_choice
 
                 if any(
-                    k not in parent_choice.CHECKS or v not in auto_checks.MODES
+                    (k not in parent_choice.CHECKS and k not in organize_auto.RUNS)
+                    or v not in auto_checks.MODES
                     for k, v in runs.items()
                 ):
-                    raise ProjectInvalid("That is not a check, or not a way it can run.")
+                    raise ProjectInvalid("That is not a run or a check, or not a way it can run.")
                 row.runs = {k: v for k, v in runs.items() if v != "off"} or None
+            _restage(row, before, datetime.now(UTC))
+            forget(project.id)
+        return self.shown(name)
+
+    def put_back(self, name: str) -> dict[str, Any]:
+        """Put the models back as they were before they were last changed. The record
+        each stage had with them counts again."""
+        with self.sessions.begin() as db:
+            project = active_project(db, name, lock=True)
+            row = db.scalar(select(ReviewSettings).where(ReviewSettings.project_id == project.id))
+            stages = dict(row.stages or {}) if row is not None else {}
+            roles = stages.get("before")
+            if row is None or not roles:
+                raise ProjectConflict("Nothing was changed that could be put back.")
+            offered = models(db, project.id)
+            for named in roles.values():
+                if named and {"provider": named[0], "model": named[1]} not in offered:
+                    raise ProjectInvalid(
+                        f"{named[1]} can no longer be asked: its account is gone, or its "
+                        "maker is no longer allowed. Choose the models above instead."
+                    )
+            for role in ("answer", "judge", "writer"):
+                named = roles.get(role) or [None, None]
+                setattr(row, role + "_provider", named[0] or None)
+                setattr(row, role + "_model", named[1])
+            for stage in STAGES:
+                kept = dict(stages.get(stage) or {})
+                earlier = kept.get("before")
+                if earlier:
+                    stages[stage] = {"key": earlier.get("key"), "since": earlier.get("since")}
+            stages.pop("before", None)
+            row.stages = stages or None
             forget(project.id)
         return self.shown(name)

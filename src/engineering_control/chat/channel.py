@@ -24,7 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from engineering_control.dashboard import auto_checks, bug_numbers
+from engineering_control.dashboard import auto_checks, bug_numbers, organize_auto
 from engineering_control.dashboard.planning_drift import digest_lines
 from engineering_control.dashboard.project_records import (
     ProjectConflict,
@@ -62,6 +62,8 @@ HELP: Final = (
     "/help — this text"
 )
 STALE: Final = timedelta(minutes=2)
+# What waits and stops nothing: it is listed, and not counted as pressing.
+NOT_PRESSING: Final = ("unrouted", "undecided", "review_cases")
 # How often the bugs are looked at for a critical one that arrived.
 BUGS_EVERY: Final = timedelta(minutes=1)
 OUTCOMES: Final = {
@@ -241,7 +243,7 @@ class ChatChannel:
             ).all()
             lines = [f"- {run.title}" for run in running]
         waiting = self.toolbox.inbox_entries()
-        urgent = [entry for entry in waiting if entry["kind"] not in ("unrouted", "undecided")]
+        urgent = [entry for entry in waiting if entry["kind"] not in NOT_PRESSING]
         parts = [
             f"**Running**: {_plural(len(lines), 'run', 'runs')} of work."
             if lines
@@ -283,6 +285,9 @@ class ChatChannel:
         if kind == "section_without_flow":
             waits = _plural(entry["count"], "item waits", "items wait")
             return f"{waits} in a section of {project} that has no flow."
+        if kind == "review_cases":
+            waits = _plural(entry["count"], "case waits", "cases wait")
+            return f"{waits} for you under {str(entry.get('page')).capitalize()} of {project}."
         if kind == "unrouted":
             return f"{_plural(entry['count'], 'item', 'items')} of {project} without a section."
         return f"{_plural(entry['count'], 'item', 'items')} of {project} to decide on."
@@ -416,12 +421,15 @@ class ChatChannel:
         lines.extend(digest_lines(self.sessions))
         # What the checks that run by themselves asked, and what it cost.
         lines.extend(auto_checks.digest_lines(self.sessions, since))
+        # What the runs of Organize and Coverage did by themselves, and the cases that
+        # wait under each.
+        lines.extend(organize_auto.digest_lines(self.sessions, since))
         # The bugs that arrived and were fixed, and what is open.
         lines.extend(bug_numbers.digest_lines(self.sessions, since))
         waiting = [
             entry
             for entry in self.toolbox.inbox_entries()
-            if entry["kind"] not in ("unrouted", "undecided")
+            if entry["kind"] not in NOT_PRESSING
         ]
         lines.append(
             f"Waiting for you: {_plural(len(waiting), 'thing', 'things')}. /inbox shows them."
