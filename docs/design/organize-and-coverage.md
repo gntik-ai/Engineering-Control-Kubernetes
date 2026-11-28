@@ -798,7 +798,7 @@ The ranking service has read none of the parts yet; the first run has it read th
 
 ### What is not in O4, and why
 
-- **No run was started on live by the platform's builder.** Starting one spends money and is the administrator's; they started two a day later (see "The first runs of Coverage on live", under O6). What a run does is covered by three tests (a run from the first reading to the answers and the undo; connected documentation and documents that change; a run without models and a project without a plan) and was looked at in a local console.
+- **No run was started on live by the platform's builder.** Starting one spends money and is the administrator's; they started two the same night (see "The first runs of Coverage on live", under O6). What a run does is covered by three tests (a run from the first reading to the answers and the undo; connected documentation and documents that change; a run without models and a project without a plan) and was looked at in a local console.
 - **The first run on Falcone takes several starts as the settings stand.** The estimate is 8.9 million tokens and one run stops at 1 million, so it would take nine starts, and the project's review tokens allow 2.28 million. Both numbers are the administrator's, under Settings; the page names both before the button. Each start goes on where the last one stopped: answers are kept.
 - **Nothing is written for a part of a connected project's documentation.** It is counted and shown; the record, if one is wanted, is the administrator's to ask for in the project the document belongs to.
 - **An Epic is never made by a run.** Decision 2 lets Epics and User Stories be made without asking. For Coverage an Epic waits all the same: one part of a document is thin ground for a whole capability, and a wrong Epic costs more to put right than a wrong Issue. One word makes all that wait.
@@ -967,7 +967,7 @@ O4 said that no run had been started on live. Two were, by the administrator, wh
 What this showed:
 
 - **One run stops at a million tokens long before the documentation is through.** A question costs about 6,000 tokens for both models together, so a run asks about some 150 parts. For the rest of falcone the page now estimates $3.01 and 14 million tokens (it said 8.9 million before the parts were read: the real questions are longer than the guess), which is fourteen starts as the settings stand. The number of tokens a run may use is the administrator's, under Settings, up to five million.
-- **The careful review holds back most of what is written.** Of 45 groups written for, 13 passed and were made; 35 wait, about half because the second model found a sentence the parts do not support. A stronger model to write would change that more than anything else.
+- **The careful review holds back most of what is written.** Of 45 groups written for, 10 passed and made 13 records; 35 wait, about half because the second model found a sentence the parts do not support. A stronger model to write would change that more than anything else.
 - **Where the two models differ, it is mostly the first saying "covered".** On falcone-serverless 21 of the 34 differences are the answering model naming a record and the judge finding none, or finding the part not about the product.
 - **Two runs do not ask at once.** The writing for falcone-serverless waited 25 minutes in the queue behind the asking for falcone. That is the check engine's rule, not Coverage's.
 
